@@ -19,6 +19,7 @@ use crate::dispatcher::{MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
 use crate::flush::EncodedSegmentSst;
 use crate::mem_table::ImmutableMemtable;
+use crate::retrying_object_store::RetryingObjectStore;
 use crate::utils::SafeSender;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,6 +33,31 @@ use tokio::runtime::Handle;
 use ulid::Ulid;
 
 const UPLOADER_TASK_NAME: &str = "l0_sst_uploader";
+
+// BufWriter can wrap an object-store error in io::Error. Preserve terminal
+// errors through that wrapper so a cancelled WAL-disabled upload stops retrying.
+fn should_retry_upload_error(error: &SlateDBError) -> bool {
+    match error {
+        SlateDBError::ObjectStoreError(error) => RetryingObjectStore::should_retry(error),
+        SlateDBError::IoError(error) => {
+            let Some(source) = error.get_ref() else {
+                return true;
+            };
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(source);
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<object_store::Error>() {
+                    return RetryingObjectStore::should_retry(error);
+                }
+                if let Some(error) = error.downcast_ref::<Arc<object_store::Error>>() {
+                    return RetryingObjectStore::should_retry(error);
+                }
+                source = error.source();
+            }
+            true
+        }
+        _ => false,
+    }
+}
 
 /// One immutable-memtable upload request submitted to the uploader. Physical
 /// SST ids are allocated at dispatch (in sequence order) and carried here, so
@@ -251,7 +277,7 @@ impl UploadHandler {
                         sst_handle,
                     });
                 }
-                Err(e) => {
+                Err(e) if should_retry_upload_error(&e) => {
                     // When the WAL is enabled and the database is shutting
                     // down, give up immediately. The data is already durable
                     // in the WAL and will be recovered on the next startup.
@@ -264,6 +290,7 @@ impl UploadHandler {
                     }
                     self.db.system_clock.sleep(self.retry_backoff).await;
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -297,7 +324,7 @@ impl MessageHandler<UploadJob> for UploadHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrackerMessage, UploadJob, Uploader};
+    use super::{should_retry_upload_error, TrackerMessage, UploadJob, Uploader};
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::config::Settings;
     use crate::db::DbInner;
@@ -335,6 +362,77 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::time::timeout;
     use ulid::Ulid;
+
+    fn cancelled_upload_error() -> object_store::Error {
+        object_store::Error::NotSupported {
+            source: std::io::Error::new(std::io::ErrorKind::Interrupted, "upload cancelled").into(),
+        }
+    }
+
+    #[test]
+    fn terminal_upload_errors_do_not_retry() {
+        for error in [
+            SlateDBError::ObjectStoreError(Arc::new(cancelled_upload_error())),
+            SlateDBError::IoError(Arc::new(std::io::Error::other(cancelled_upload_error()))),
+            SlateDBError::IoError(Arc::new(std::io::Error::other(Arc::new(
+                cancelled_upload_error(),
+            )))),
+        ] {
+            assert!(!should_retry_upload_error(&error));
+        }
+    }
+
+    #[test]
+    fn transient_io_errors_still_retry() {
+        assert!(should_retry_upload_error(&SlateDBError::IoError(Arc::new(
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "transient upload failure"
+            )
+        ))));
+    }
+
+    #[tokio::test]
+    async fn wal_disabled_uploader_stops_after_terminal_storage_error() {
+        for value_size in [8, 11 * 1024 * 1024] {
+            let path = "/tmp/test_cancelled_bulk_upload";
+            let mut db = setup_db(path, Arc::new(FailPointRegistry::new())).await;
+            let store = Arc::new(crate::test_utils::GatedObjectStore::new(Arc::new(
+                InMemory::new(),
+            )));
+            store.put_opts_gate.set_error(cancelled_upload_error);
+            store
+                .put_multipart_opts_gate
+                .set_error(cancelled_upload_error);
+            let inner = Arc::get_mut(&mut db).unwrap();
+            inner.wal_enabled = false;
+            inner.table_store = Arc::new(TableStore::new(
+                ObjectStores::new(store.clone(), None),
+                SsTableFormat::default(),
+                path,
+                None,
+                TableStoreKind::Main,
+                BlockCachePolicy::default(),
+            ));
+            let job = next_upload_job(&db, b"key", &vec![42; value_size], 1);
+            let uploader = start_test_uploader(&db);
+            uploader.submit(job).unwrap();
+            let error = timeout(Duration::from_secs(2), uploader.await_closed())
+                .await
+                .expect("cancelled bulk upload must stop without WAL shutdown")
+                .unwrap_err();
+            assert!(!should_retry_upload_error(&error));
+            assert!(format!("{error:?}").contains("upload cancelled"));
+            assert_eq!(
+                store.put_opts_gate.arrivals() + store.put_multipart_opts_gate.arrivals(),
+                1
+            );
+            assert!(uploader.tracker_rx.try_recv().is_err());
+            timeout(Duration::from_secs(2), uploader.shutdown())
+                .await
+                .expect("cancelled uploader shutdown must finish");
+        }
+    }
 
     /// Build a pre-allocated id map for a test job, mirroring dispatch-time
     /// allocation: one id per segment prefix, falling back to the empty prefix
