@@ -342,7 +342,7 @@ impl DbInner {
 
             if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
                 self.db_stats.backpressure_count.increment(1);
-                warn!(
+                debug!(
                     "unflushed WAL and memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}]",
                     format_bytes_si(total_mem_size_bytes as u64),
                     format_bytes_si(active_memtable_size_bytes as u64),
